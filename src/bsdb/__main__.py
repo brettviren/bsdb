@@ -1,8 +1,10 @@
+import shlex
 import sys
 
 import click
 
 from bsdb.tmux import attach as tmux_attach
+from bsdb.tmux import connection as tmux_connection
 from bsdb.tmux import launch as tmux_launch
 from bsdb.tmux import list as tmux_list
 
@@ -36,6 +38,18 @@ def attach(target, remote):
     rc = tmux_attach(target, remote=remote)
     if rc:
         sys.exit(rc)
+
+
+@cli.command("connection")
+@click.argument("target")
+@click.option("-r", "--remote", default=None, help="SSH target, e.g. user@host.")
+def connection_cmd(target, remote):
+    """Print the command to attach to session TARGET.
+
+    TARGET may be a session name, a tmux ID (e.g. $0), or the
+    "remote:name" string printed by the launch command.
+    """
+    click.echo(shlex.join(tmux_connection(target, remote=remote)))
 
 
 @cli.command("list")

@@ -85,6 +85,35 @@ def _run(args: list[str], remote: Optional[str] = None) -> subprocess.CompletedP
     return subprocess.run(args, capture_output=True, text=True, check=True)
 
 
+def connection(
+    session: "SessionInfo | str",
+    remote: Optional[str] = None,
+) -> list[str]:
+    """Return the command list needed to attach to an existing tmux session.
+
+    Accepts the same arguments as :func:`attach`.  The returned list can be
+    passed directly to :func:`subprocess.run` or formatted with
+    :func:`shlex.join` for copy-paste execution.
+
+    Args:
+        session: A :class:`SessionInfo`, a tmux session ID (e.g. ``$0``), a
+                 session name, or a ``"host:name"`` string as printed by
+                 :func:`launch`.
+        remote:  SSH target; ``None`` = local.
+
+    Returns:
+        ``["tmux", "attach-session", "-t", target]`` for local sessions, or
+        ``["ssh", "-t", remote, "$SHELL -l -c <cmd>"]`` for remote ones.
+    """
+    target, remote = _resolve_session_spec(session, remote)
+    args = ["tmux", "attach-session", "-t", target]
+    if remote:
+        # ssh -t allocates a PTY so the tmux client can drive the terminal.
+        # $SHELL -l ensures the remote PATH is set up.
+        return ["ssh", "-t", remote, f"$SHELL -l -c {shlex.quote(shlex.join(args))}"]
+    return args
+
+
 def attach(
     session: "SessionInfo | str",
     remote: Optional[str] = None,
@@ -101,21 +130,7 @@ def attach(
     Returns:
         Exit code of ``tmux attach-session`` (0 = normal detach).
     """
-    target, remote = _resolve_session_spec(session, remote)
-
-    args = ["tmux", "attach-session", "-t", target]
-
-    if remote:
-        # ssh -t allocates a PTY so the tmux client can drive the terminal.
-        # $SHELL -l ensures the remote PATH is set up (same approach as _run,
-        # but stdin-piping cannot be used here because -t owns stdin).
-        result = subprocess.run(
-            ["ssh", "-t", remote, f"$SHELL -l -c {shlex.quote(shlex.join(args))}"],
-        )
-    else:
-        result = subprocess.run(args)
-
-    return result.returncode
+    return subprocess.run(connection(session, remote)).returncode
 
 
 def list(remote: Optional[str] = None) -> "list[SessionInfo]":

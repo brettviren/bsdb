@@ -6,7 +6,7 @@ from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
-from bsdb.tmux import SessionInfo, _resolve_remote, attach, launch
+from bsdb.tmux import SessionInfo, _resolve_remote, attach, connection, launch
 from bsdb.tmux import list as tmux_list
 
 
@@ -367,3 +367,69 @@ class TestList:
         with patch("bsdb.tmux._run", return_value=_mock_result(row + "\n")):
             sessions = tmux_list()
         assert sessions[0].cwd is None
+
+
+# ---------------------------------------------------------------------------
+# connection()
+# ---------------------------------------------------------------------------
+
+
+class TestConnection:
+    def test_local_session_name(self):
+        cmd = connection("my-session")
+        assert cmd == ["tmux", "attach-session", "-t", "my-session"]
+
+    def test_local_session_id(self):
+        cmd = connection("$3")
+        assert cmd == ["tmux", "attach-session", "-t", "$3"]
+
+    def test_remote_via_colon_string(self):
+        cmd = connection("haiku:my-session")
+        assert cmd[0] == "ssh"
+        assert cmd[1] == "-t"
+        assert cmd[2] == "haiku"
+        assert "my-session" in cmd[3]
+        assert "haiku" not in cmd[3].replace("$SHELL", "")
+
+    def test_remote_via_kwarg(self):
+        cmd = connection("my-session", remote="haiku")
+        assert cmd[0] == "ssh"
+        assert cmd[1] == "-t"
+        assert cmd[2] == "haiku"
+        assert "my-session" in cmd[3]
+
+    def test_session_info_local(self):
+        info = SessionInfo(
+            session_name="s", session_id="$5", window_id="@0", pane_id="%0",
+            pane_pid=1, remote=None, created_at=__import__("datetime").datetime.now(),
+            cmd="sleep 1", cwd=None,
+        )
+        cmd = connection(info)
+        assert cmd == ["tmux", "attach-session", "-t", "$5"]
+
+    def test_session_info_remote(self):
+        info = SessionInfo(
+            session_name="s", session_id="$5", window_id="@0", pane_id="%0",
+            pane_pid=1, remote="haiku", created_at=__import__("datetime").datetime.now(),
+            cmd="sleep 1", cwd=None,
+        )
+        cmd = connection(info)
+        assert cmd[0] == "ssh"
+        assert cmd[2] == "haiku"
+        assert "'$5'" in cmd[3]
+
+    def test_explicit_remote_overrides_session_info(self):
+        info = SessionInfo(
+            session_name="s", session_id="$5", window_id="@0", pane_id="%0",
+            pane_pid=1, remote="original", created_at=__import__("datetime").datetime.now(),
+            cmd="sleep 1", cwd=None,
+        )
+        cmd = connection(info, remote="override")
+        assert cmd[2] == "override"
+
+    def test_localhost_treated_as_local(self):
+        cmd = connection("my-session", remote="localhost")
+        assert cmd == ["tmux", "attach-session", "-t", "my-session"]
+
+    def test_returns_list(self):
+        assert isinstance(connection("s"), list)
