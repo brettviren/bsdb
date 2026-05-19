@@ -1,12 +1,13 @@
-"""Tests for bsdb.tmux.launch() and bsdb.tmux.attach()."""
+"""Tests for bsdb.tmux: launch(), attach(), list(), and helpers."""
 
 import subprocess
 from datetime import timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
-from bsdb.tmux import SessionInfo, attach, launch
+from bsdb.tmux import SessionInfo, _resolve_remote, attach, launch
+from bsdb.tmux import list as tmux_list
 
 
 # ---------------------------------------------------------------------------
@@ -243,3 +244,126 @@ class TestAttachTargetResolution:
         call = self._run_attach(info, remote="override")
         cmd = call.args[0]
         assert cmd[2] == "override"
+
+
+# ---------------------------------------------------------------------------
+# _resolve_remote
+# ---------------------------------------------------------------------------
+
+
+class TestResolveRemote:
+    def test_none_returns_none(self):
+        assert _resolve_remote(None) is None
+
+    def test_empty_string_returns_none(self):
+        assert _resolve_remote("") is None
+
+    def test_localhost_returns_none(self):
+        assert _resolve_remote("localhost") is None
+
+    def test_trailing_colon_stripped(self):
+        assert _resolve_remote("haiku:") == "haiku"
+
+    def test_localhost_colon_returns_none(self):
+        assert _resolve_remote("localhost:") is None
+
+    def test_regular_host_unchanged(self):
+        assert _resolve_remote("haiku") == "haiku"
+
+    def test_user_at_host_unchanged(self):
+        assert _resolve_remote("user@haiku") == "user@haiku"
+
+
+# ---------------------------------------------------------------------------
+# list()
+# ---------------------------------------------------------------------------
+
+_SAMPLE_ROW = "\t".join([
+    "0",            # window_index
+    "0",            # pane_index
+    "$2",           # session_id
+    "my-session",   # session_name
+    "1700000000",   # session_created (Unix timestamp)
+    "@1",           # window_id
+    "%3",           # pane_id
+    "42",           # pane_pid
+    "emacs",        # pane_current_command
+    "/home/user",   # pane_current_path
+])
+
+
+def _mock_result(stdout: str) -> MagicMock:
+    m = MagicMock()
+    m.stdout = stdout
+    return m
+
+
+class TestList:
+    def test_returns_session_info(self):
+        with patch("bsdb.tmux._run", return_value=_mock_result(_SAMPLE_ROW + "\n")):
+            sessions = tmux_list()
+        assert len(sessions) == 1
+        s = sessions[0]
+        assert s.session_name == "my-session"
+        assert s.session_id == "$2"
+        assert s.window_id == "@1"
+        assert s.pane_id == "%3"
+        assert s.pane_pid == 42
+        assert s.cmd == "emacs"
+        assert s.cwd == "/home/user"
+        assert s.remote is None
+
+    def test_created_at_utc(self):
+        with patch("bsdb.tmux._run", return_value=_mock_result(_SAMPLE_ROW + "\n")):
+            sessions = tmux_list()
+        assert sessions[0].created_at.tzinfo is timezone.utc
+
+    def test_localhost_queries_locally(self):
+        with patch("bsdb.tmux._run", return_value=_mock_result(_SAMPLE_ROW + "\n")) as m:
+            sessions = tmux_list("localhost")
+        m.assert_called_once_with(["tmux", "list-panes", "-a", "-F", ANY], None)
+        assert sessions[0].remote is None
+
+    def test_remote_host_passed_through(self):
+        with patch("bsdb.tmux._run", return_value=_mock_result(_SAMPLE_ROW + "\n")) as m:
+            tmux_list("haiku")
+        m.assert_called_once_with(["tmux", "list-panes", "-a", "-F", ANY], "haiku")
+
+    def test_empty_on_no_server(self):
+        with patch("bsdb.tmux._run", side_effect=subprocess.CalledProcessError(1, "tmux")):
+            assert tmux_list() == []
+
+    def test_skips_non_first_pane(self):
+        second_pane = "\t".join([
+            "0", "1", "$2", "my-session", "1700000000", "@1", "%4", "99", "bash", "/tmp",
+        ])
+        output = _SAMPLE_ROW + "\n" + second_pane + "\n"
+        with patch("bsdb.tmux._run", return_value=_mock_result(output)):
+            sessions = tmux_list()
+        assert len(sessions) == 1
+
+    def test_skips_non_first_window(self):
+        second_window = "\t".join([
+            "1", "0", "$2", "my-session", "1700000000", "@2", "%5", "99", "vim", "/tmp",
+        ])
+        output = _SAMPLE_ROW + "\n" + second_window + "\n"
+        with patch("bsdb.tmux._run", return_value=_mock_result(output)):
+            sessions = tmux_list()
+        assert len(sessions) == 1
+
+    def test_multiple_sessions(self):
+        row2 = "\t".join([
+            "0", "0", "$3", "other-session", "1700000001", "@2", "%4", "99", "vim", "/tmp",
+        ])
+        output = _SAMPLE_ROW + "\n" + row2 + "\n"
+        with patch("bsdb.tmux._run", return_value=_mock_result(output)):
+            sessions = tmux_list()
+        assert len(sessions) == 2
+        names = {s.session_name for s in sessions}
+        assert names == {"my-session", "other-session"}
+
+    def test_empty_cwd_becomes_none(self):
+        row = "\t".join(["0", "0", "$2", "s", "1700000000", "@0", "%0", "1", "sh", ""])
+        with patch("bsdb.tmux._run", return_value=_mock_result(row + "\n")):
+            sessions = tmux_list()
+        assert sessions[0].cwd is None

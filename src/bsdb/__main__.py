@@ -4,6 +4,7 @@ import click
 
 from bsdb.tmux import attach as tmux_attach
 from bsdb.tmux import launch as tmux_launch
+from bsdb.tmux import list as tmux_list
 
 
 @click.group()
@@ -23,16 +24,10 @@ def launch(cmd, name, cwd, remote):
     click.echo(f"launched {where}{info.session_name}  (pid {info.pane_pid})")
 
 
-@cli.group()
-def session():
-    """Manage existing tmux sessions."""
-    pass
-
-
-@session.command("attach")
+@cli.command("attach")
 @click.argument("target")
 @click.option("-r", "--remote", default=None, help="SSH target, e.g. user@host.")
-def session_attach(target, remote):
+def attach(target, remote):
     """Attach to session TARGET.
 
     TARGET may be a session name, a tmux ID (e.g. $0), or the
@@ -41,6 +36,27 @@ def session_attach(target, remote):
     rc = tmux_attach(target, remote=remote)
     if rc:
         sys.exit(rc)
+
+
+@cli.command("list")
+@click.argument("remotes", nargs=-1)
+@click.pass_context
+def list_cmd(ctx, remotes):
+    """List tmux sessions on each REMOTE (alias: ls).
+
+    REMOTE may be a hostname, "localhost" for local sessions, or the "host:"
+    form.  Multiple REMOTEs may be given.  If no REMOTE is given, print help.
+    """
+    if not remotes:
+        click.echo(ctx.get_help())
+        return
+    for remote_arg in remotes:
+        for info in tmux_list(remote_arg):
+            where = f"{info.remote}:" if info.remote else ""
+            click.echo(f"{where}{info.session_name}  (pid {info.pane_pid})")
+
+
+cli.add_command(list_cmd, name="ls")
 
 
 def main():

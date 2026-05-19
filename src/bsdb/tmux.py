@@ -1,5 +1,7 @@
 """Primitive functions for launching and managing tmux sessions locally or via SSH."""
 
+from __future__ import annotations
+
 import shlex
 import subprocess
 import uuid
@@ -27,6 +29,45 @@ class SessionInfo:
     cwd: Optional[str]     # working directory used, or None
 
 
+def _resolve_remote(remote: Optional[str]) -> Optional[str]:
+    """Canonicalize a remote specifier; returns ``None`` for local execution.
+
+    ``None``, empty string, ``"localhost"``, and any of these with a trailing
+    colon all map to ``None``.  Everything else is returned unchanged.
+    """
+    if remote:
+        remote = remote.rstrip(":")
+    return None if not remote or remote == "localhost" else remote
+
+
+def _resolve_session_spec(
+    session: "SessionInfo | str",
+    remote: Optional[str] = None,
+) -> tuple[str, Optional[str]]:
+    """Resolve a session specifier to ``(tmux_target, canonicalized_remote)``.
+
+    Accepted forms for *session*:
+
+    * :class:`SessionInfo` — uses ``session_id``; inherits stored ``remote``
+    * ``"host:target"`` — splits on the first colon
+    * ``"target"`` — plain tmux name or ``$N`` ID; remote stays as given
+
+    An explicit *remote* argument always takes precedence over any remote
+    embedded in *session*.  The resolved remote is passed through
+    :func:`_resolve_remote`.
+    """
+    if isinstance(session, SessionInfo):
+        target = session.session_id
+        resolved = remote if remote is not None else session.remote
+    elif ":" in session:
+        embedded, target = session.split(":", 1)
+        resolved = remote if remote is not None else embedded
+    else:
+        target = session
+        resolved = remote
+    return target, _resolve_remote(resolved)
+
+
 def _run(args: list[str], remote: Optional[str] = None) -> subprocess.CompletedProcess:
     """Run *args* locally, or via ``ssh remote`` if *remote* is given.
 
@@ -51,25 +92,16 @@ def attach(
     """Attach to an existing tmux session in the current terminal.
 
     Args:
-        session: A :class:`SessionInfo`, a tmux session ID (e.g. ``$0``), or
-                 a session name.  When a :class:`SessionInfo` is given its
+        session: A :class:`SessionInfo`, a tmux session ID (e.g. ``$0``), a
+                 session name, or a ``"host:name"`` string as printed by
+                 :func:`launch`.  When a :class:`SessionInfo` is given its
                  stored ``remote`` is used unless *remote* overrides it.
         remote:  SSH target; ``None`` = local.
 
     Returns:
         Exit code of ``tmux attach-session`` (0 = normal detach).
     """
-    if isinstance(session, SessionInfo):
-        target = session.session_id
-        if remote is None:
-            remote = session.remote
-    elif ":" in session:
-        # "remote:name" form — matches the output printed by launch().
-        remote_str, target = session.split(":", 1)
-        if remote is None:
-            remote = remote_str or None
-    else:
-        target = session
+    target, remote = _resolve_session_spec(session, remote)
 
     args = ["tmux", "attach-session", "-t", target]
 
@@ -84,6 +116,70 @@ def attach(
         result = subprocess.run(args)
 
     return result.returncode
+
+
+def list(remote: Optional[str] = None) -> "list[SessionInfo]":
+    """Return all active tmux sessions visible from *remote*.
+
+    Args:
+        remote: SSH target, ``None``, or ``"localhost"`` for local sessions.
+                ``"host:"`` form is also accepted.  Multiple calls may be made
+                to query several hosts.
+
+    Returns:
+        One :class:`SessionInfo` per session, in the order tmux reports them.
+        ``cmd`` and ``cwd`` reflect the pane's *current* process and working
+        directory rather than the original :func:`launch` values.
+
+    An empty list is returned (no exception) when there is no tmux server or
+    when SSH fails.
+    """
+    effective_remote = _resolve_remote(remote)
+
+    fmt = "\t".join([
+        "#{window_index}",
+        "#{pane_index}",
+        "#{session_id}",
+        "#{session_name}",
+        "#{session_created}",
+        "#{window_id}",
+        "#{pane_id}",
+        "#{pane_pid}",
+        "#{pane_current_command}",
+        "#{pane_current_path}",
+    ])
+
+    try:
+        result = _run(["tmux", "list-panes", "-a", "-F", fmt], effective_remote)
+    except subprocess.CalledProcessError:
+        return []
+
+    seen: dict[str, SessionInfo] = {}
+    for line in result.stdout.splitlines():
+        if not line:
+            continue
+        parts = line.split("\t", 9)
+        if len(parts) < 10:
+            continue
+        (win_idx, pane_idx, session_id, session_name,
+         created_ts, window_id, pane_id, pane_pid_str, cmd, cwd) = parts
+        if int(win_idx) != 0 or int(pane_idx) != 0:
+            continue
+        if session_id in seen:
+            continue
+        seen[session_id] = SessionInfo(
+            session_name=session_name,
+            session_id=session_id,
+            window_id=window_id,
+            pane_id=pane_id,
+            pane_pid=int(pane_pid_str),
+            remote=effective_remote,
+            created_at=datetime.fromtimestamp(int(created_ts), tz=timezone.utc),
+            cmd=cmd,
+            cwd=cwd.strip() or None,
+        )
+
+    return [*seen.values()]
 
 
 def launch(
@@ -108,7 +204,7 @@ def launch(
     Raises:
         subprocess.CalledProcessError: if tmux or ssh exits non-zero.
     """
-    cmd_str = shlex.join(cmd) if isinstance(cmd, list) else cmd
+    cmd_str = shlex.join(cmd) if not isinstance(cmd, str) else cmd
 
     if name is None:
         name = f"bsdb-{uuid.uuid4().hex[:8]}"
