@@ -44,6 +44,48 @@ def _run(args: list[str], remote: Optional[str] = None) -> subprocess.CompletedP
     return subprocess.run(args, capture_output=True, text=True, check=True)
 
 
+def attach(
+    session: "SessionInfo | str",
+    remote: Optional[str] = None,
+) -> int:
+    """Attach to an existing tmux session in the current terminal.
+
+    Args:
+        session: A :class:`SessionInfo`, a tmux session ID (e.g. ``$0``), or
+                 a session name.  When a :class:`SessionInfo` is given its
+                 stored ``remote`` is used unless *remote* overrides it.
+        remote:  SSH target; ``None`` = local.
+
+    Returns:
+        Exit code of ``tmux attach-session`` (0 = normal detach).
+    """
+    if isinstance(session, SessionInfo):
+        target = session.session_id
+        if remote is None:
+            remote = session.remote
+    elif ":" in session:
+        # "remote:name" form — matches the output printed by launch().
+        remote_str, target = session.split(":", 1)
+        if remote is None:
+            remote = remote_str or None
+    else:
+        target = session
+
+    args = ["tmux", "attach-session", "-t", target]
+
+    if remote:
+        # ssh -t allocates a PTY so the tmux client can drive the terminal.
+        # $SHELL -l ensures the remote PATH is set up (same approach as _run,
+        # but stdin-piping cannot be used here because -t owns stdin).
+        result = subprocess.run(
+            ["ssh", "-t", remote, f"$SHELL -l -c {shlex.quote(shlex.join(args))}"],
+        )
+    else:
+        result = subprocess.run(args)
+
+    return result.returncode
+
+
 def launch(
     cmd: str | list[str],
     name: Optional[str] = None,

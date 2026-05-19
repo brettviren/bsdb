@@ -1,11 +1,12 @@
-"""Tests for bsdb.tmux.launch()."""
+"""Tests for bsdb.tmux.launch() and bsdb.tmux.attach()."""
 
 import subprocess
 from datetime import timezone
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from bsdb.tmux import SessionInfo, launch
+from bsdb.tmux import SessionInfo, attach, launch
 
 
 # ---------------------------------------------------------------------------
@@ -176,3 +177,69 @@ class TestLaunchRemoteLocalhost:
         launched_sessions.append(info)
 
         assert _session_exists_remote(info.session_id, "localhost")
+
+
+# ---------------------------------------------------------------------------
+# attach() target resolution (no real tmux interaction needed)
+# ---------------------------------------------------------------------------
+
+
+class TestAttachTargetResolution:
+    """Verify that attach() resolves the session/remote correctly before
+    calling subprocess.  The actual attach is mocked so no TTY is needed."""
+
+    def _run_attach(self, *args, **kwargs):
+        """Call attach() with subprocess.run mocked out; return the call args."""
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        with patch("bsdb.tmux.subprocess.run", return_value=mock_result) as m:
+            attach(*args, **kwargs)
+        return m.call_args
+
+    def test_session_name_local(self):
+        call = self._run_attach("my-session")
+        cmd = call.args[0]
+        assert cmd == ["tmux", "attach-session", "-t", "my-session"]
+
+    def test_session_id_local(self):
+        call = self._run_attach("$3")
+        cmd = call.args[0]
+        assert cmd == ["tmux", "attach-session", "-t", "$3"]
+
+    def test_remote_colon_name(self):
+        """'host:name' form sets remote and strips the prefix from target."""
+        call = self._run_attach("haiku:my-session")
+        # ["ssh", "-t", remote, shell-cmd]
+        cmd = call.args[0]
+        assert cmd[0] == "ssh"
+        assert cmd[1] == "-t"
+        assert cmd[2] == "haiku"
+        assert "my-session" in cmd[3]
+        assert "haiku" not in cmd[3].replace("$SHELL", "")  # remote not in tmux cmd
+
+    def test_remote_colon_name_explicit_remote_overrides(self):
+        """An explicit remote= overrides the one embedded in the string."""
+        call = self._run_attach("ignored-host:my-session", remote="real-host")
+        cmd = call.args[0]
+        assert cmd[2] == "real-host"
+
+    def test_session_info_uses_stored_remote(self):
+        info = SessionInfo(
+            session_name="s", session_id="$0", window_id="@0", pane_id="%0",
+            pane_pid=1, remote="stored-host", created_at=__import__("datetime").datetime.now(),
+            cmd="sleep 1", cwd=None,
+        )
+        call = self._run_attach(info)
+        cmd = call.args[0]
+        assert cmd[2] == "stored-host"
+        assert "'$0'" in cmd[3]  # session_id single-quoted to suppress shell expansion
+
+    def test_session_info_remote_overridden(self):
+        info = SessionInfo(
+            session_name="s", session_id="$0", window_id="@0", pane_id="%0",
+            pane_pid=1, remote="original", created_at=__import__("datetime").datetime.now(),
+            cmd="sleep 1", cwd=None,
+        )
+        call = self._run_attach(info, remote="override")
+        cmd = call.args[0]
+        assert cmd[2] == "override"
