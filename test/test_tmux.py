@@ -1,13 +1,36 @@
 """Tests for bsdb.tmux: launch(), attach(), list(), and helpers."""
 
 import subprocess
-from datetime import timezone
+from datetime import datetime, timezone
 from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
 from bsdb.tmux import SessionInfo, _resolve_remote, attach, connection, launch
 from bsdb.tmux import list as tmux_list
+
+_NOW = datetime.now(tz=timezone.utc)
+
+
+def _make_session_info(**overrides) -> SessionInfo:
+    """Build a minimal SessionInfo for use in unit tests."""
+    defaults = dict(
+        session_name="s",
+        session_id="$0",
+        window_id="@0",
+        pane_id="%0",
+        pane_pid=1,
+        remote=None,
+        created_at=_NOW,
+        cmd="sleep 1",
+        cwd=None,
+        attached=0,
+        activity_at=_NOW,
+        last_attached_at=None,
+        many_attached=False,
+    )
+    defaults.update(overrides)
+    return SessionInfo(**defaults)
 
 
 # ---------------------------------------------------------------------------
@@ -225,22 +248,14 @@ class TestAttachTargetResolution:
         assert cmd[2] == "real-host"
 
     def test_session_info_uses_stored_remote(self):
-        info = SessionInfo(
-            session_name="s", session_id="$0", window_id="@0", pane_id="%0",
-            pane_pid=1, remote="stored-host", created_at=__import__("datetime").datetime.now(),
-            cmd="sleep 1", cwd=None,
-        )
+        info = _make_session_info(remote="stored-host")
         call = self._run_attach(info)
         cmd = call.args[0]
         assert cmd[2] == "stored-host"
         assert "'$0'" in cmd[3]  # session_id single-quoted to suppress shell expansion
 
     def test_session_info_remote_overridden(self):
-        info = SessionInfo(
-            session_name="s", session_id="$0", window_id="@0", pane_id="%0",
-            pane_pid=1, remote="original", created_at=__import__("datetime").datetime.now(),
-            cmd="sleep 1", cwd=None,
-        )
+        info = _make_session_info(remote="original")
         call = self._run_attach(info, remote="override")
         cmd = call.args[0]
         assert cmd[2] == "override"
@@ -289,6 +304,10 @@ _SAMPLE_ROW = "\t".join([
     "42",           # pane_pid
     "emacs",        # pane_current_command
     "/home/user",   # pane_current_path
+    "1",            # session_attached
+    "1700000100",   # session_activity (Unix timestamp)
+    "1700000050",   # session_last_attached (Unix timestamp)
+    "0",            # session_many_attached
 ])
 
 
@@ -312,6 +331,24 @@ class TestList:
         assert s.cmd == "emacs"
         assert s.cwd == "/home/user"
         assert s.remote is None
+        assert s.attached == 1
+        assert s.activity_at.tzinfo is timezone.utc
+        assert s.last_attached_at.tzinfo is timezone.utc
+        assert s.many_attached is False
+
+    def test_many_attached_true(self):
+        row = _SAMPLE_ROW.rsplit("\t", 1)[0] + "\t1"  # flip many_attached to 1
+        with patch("bsdb.tmux._run", return_value=_mock_result(row + "\n")):
+            sessions = tmux_list()
+        assert sessions[0].many_attached is True
+
+    def test_activity_timestamps_parsed(self):
+        with patch("bsdb.tmux._run", return_value=_mock_result(_SAMPLE_ROW + "\n")):
+            sessions = tmux_list()
+        s = sessions[0]
+        from datetime import datetime
+        assert s.activity_at == datetime.fromtimestamp(1700000100, tz=timezone.utc)
+        assert s.last_attached_at == datetime.fromtimestamp(1700000050, tz=timezone.utc)
 
     def test_created_at_utc(self):
         with patch("bsdb.tmux._run", return_value=_mock_result(_SAMPLE_ROW + "\n")):
@@ -336,6 +373,7 @@ class TestList:
     def test_skips_non_first_pane(self):
         second_pane = "\t".join([
             "0", "1", "$2", "my-session", "1700000000", "@1", "%4", "99", "bash", "/tmp",
+            "1", "1700000100", "1700000050", "0",
         ])
         output = _SAMPLE_ROW + "\n" + second_pane + "\n"
         with patch("bsdb.tmux._run", return_value=_mock_result(output)):
@@ -345,6 +383,7 @@ class TestList:
     def test_skips_non_first_window(self):
         second_window = "\t".join([
             "1", "0", "$2", "my-session", "1700000000", "@2", "%5", "99", "vim", "/tmp",
+            "1", "1700000100", "1700000050", "0",
         ])
         output = _SAMPLE_ROW + "\n" + second_window + "\n"
         with patch("bsdb.tmux._run", return_value=_mock_result(output)):
@@ -354,6 +393,7 @@ class TestList:
     def test_multiple_sessions(self):
         row2 = "\t".join([
             "0", "0", "$3", "other-session", "1700000001", "@2", "%4", "99", "vim", "/tmp",
+            "0", "1700000101", "1700000051", "0",
         ])
         output = _SAMPLE_ROW + "\n" + row2 + "\n"
         with patch("bsdb.tmux._run", return_value=_mock_result(output)):
@@ -362,8 +402,16 @@ class TestList:
         names = {s.session_name for s in sessions}
         assert names == {"my-session", "other-session"}
 
+    def test_never_attached_last_attached_at_is_none(self):
+        row = "\t".join(["0", "0", "$2", "s", "1700000000", "@0", "%0", "1", "sh", "/tmp",
+                         "0", "1700000100", "", "0"])
+        with patch("bsdb.tmux._run", return_value=_mock_result(row + "\n")):
+            sessions = tmux_list()
+        assert sessions[0].last_attached_at is None
+
     def test_empty_cwd_becomes_none(self):
-        row = "\t".join(["0", "0", "$2", "s", "1700000000", "@0", "%0", "1", "sh", ""])
+        row = "\t".join(["0", "0", "$2", "s", "1700000000", "@0", "%0", "1", "sh", "",
+                         "1", "1700000100", "1700000050", "0"])
         with patch("bsdb.tmux._run", return_value=_mock_result(row + "\n")):
             sessions = tmux_list()
         assert sessions[0].cwd is None
@@ -399,31 +447,19 @@ class TestConnection:
         assert "my-session" in cmd[3]
 
     def test_session_info_local(self):
-        info = SessionInfo(
-            session_name="s", session_id="$5", window_id="@0", pane_id="%0",
-            pane_pid=1, remote=None, created_at=__import__("datetime").datetime.now(),
-            cmd="sleep 1", cwd=None,
-        )
+        info = _make_session_info(session_id="$5")
         cmd = connection(info)
         assert cmd == ["tmux", "attach-session", "-t", "$5"]
 
     def test_session_info_remote(self):
-        info = SessionInfo(
-            session_name="s", session_id="$5", window_id="@0", pane_id="%0",
-            pane_pid=1, remote="haiku", created_at=__import__("datetime").datetime.now(),
-            cmd="sleep 1", cwd=None,
-        )
+        info = _make_session_info(session_id="$5", remote="haiku")
         cmd = connection(info)
         assert cmd[0] == "ssh"
         assert cmd[2] == "haiku"
         assert "'$5'" in cmd[3]
 
     def test_explicit_remote_overrides_session_info(self):
-        info = SessionInfo(
-            session_name="s", session_id="$5", window_id="@0", pane_id="%0",
-            pane_pid=1, remote="original", created_at=__import__("datetime").datetime.now(),
-            cmd="sleep 1", cwd=None,
-        )
+        info = _make_session_info(session_id="$5", remote="original")
         cmd = connection(info, remote="override")
         assert cmd[2] == "override"
 

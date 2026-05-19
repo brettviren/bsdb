@@ -27,6 +27,10 @@ class SessionInfo:
     created_at: datetime   # session creation time (UTC)
     cmd: str               # normalised command string passed to tmux
     cwd: Optional[str]     # working directory used, or None
+    attached: int          # number of clients currently attached
+    activity_at: datetime  # time of last pane activity (UTC)
+    last_attached_at: Optional[datetime]  # time a client last attached (UTC); None if never attached
+    many_attached: bool    # True when more than one client is attached
 
 
 def _resolve_remote(remote: Optional[str]) -> Optional[str]:
@@ -162,6 +166,10 @@ def list(remote: Optional[str] = None) -> "list[SessionInfo]":
         "#{pane_pid}",
         "#{pane_current_command}",
         "#{pane_current_path}",
+        "#{session_attached}",
+        "#{session_activity}",
+        "#{session_last_attached}",
+        "#{session_many_attached}",
     ])
 
     try:
@@ -173,11 +181,12 @@ def list(remote: Optional[str] = None) -> "list[SessionInfo]":
     for line in result.stdout.splitlines():
         if not line:
             continue
-        parts = line.split("\t", 9)
-        if len(parts) < 10:
+        parts = line.split("\t", 13)
+        if len(parts) < 14:
             continue
         (win_idx, pane_idx, session_id, session_name,
-         created_ts, window_id, pane_id, pane_pid_str, cmd, cwd) = parts
+         created_ts, window_id, pane_id, pane_pid_str, cmd, cwd,
+         attached_str, activity_ts, last_attached_ts, many_attached_str) = parts
         if int(win_idx) != 0 or int(pane_idx) != 0:
             continue
         if session_id in seen:
@@ -192,6 +201,10 @@ def list(remote: Optional[str] = None) -> "list[SessionInfo]":
             created_at=datetime.fromtimestamp(int(created_ts), tz=timezone.utc),
             cmd=cmd,
             cwd=cwd.strip() or None,
+            attached=int(attached_str),
+            activity_at=datetime.fromtimestamp(int(activity_ts), tz=timezone.utc),
+            last_attached_at=datetime.fromtimestamp(int(last_attached_ts), tz=timezone.utc) if last_attached_ts.strip() else None,
+            many_attached=bool(int(many_attached_str)),
         )
 
     return [*seen.values()]
@@ -231,12 +244,17 @@ def launch(
 
     _run(new_args, remote)
 
-    fmt = "#{session_id}|#{window_id}|#{pane_id}|#{pane_pid}|#{session_created}"
+    fmt = "|".join([
+        "#{session_id}", "#{window_id}", "#{pane_id}", "#{pane_pid}",
+        "#{session_created}", "#{session_attached}",
+        "#{session_activity}", "#{session_last_attached}", "#{session_many_attached}",
+    ])
     result = _run(["tmux", "display-message", "-t", name, "-p", fmt], remote)
 
     # Take the last line in case login scripts wrote anything to stdout before
     # the tmux output.
-    session_id, window_id, pane_id, pane_pid_str, created_ts = (
+    (session_id, window_id, pane_id, pane_pid_str,
+     created_ts, attached_str, activity_ts, last_attached_ts, many_attached_str) = (
         result.stdout.strip().split("\n")[-1].split("|")
     )
 
@@ -250,4 +268,8 @@ def launch(
         created_at=datetime.fromtimestamp(int(created_ts), tz=timezone.utc),
         cmd=cmd_str,
         cwd=cwd,
+        attached=int(attached_str),
+        activity_at=datetime.fromtimestamp(int(activity_ts), tz=timezone.utc),
+        last_attached_at=datetime.fromtimestamp(int(last_attached_ts), tz=timezone.utc) if last_attached_ts.strip() else None,
+        many_attached=bool(int(many_attached_str)),
     )
