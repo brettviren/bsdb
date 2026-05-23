@@ -2,7 +2,7 @@
 name = "bsdb"
 version = "0.1.0"
 description = "Add your description here"
-readme = "README.md"
+readme = {file = "README.org", content-type = "text/org"}
 authors = [
     { name = "Brett Viren", email = "brett.viren@gmail.com" }
 ]
