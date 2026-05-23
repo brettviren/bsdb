@@ -221,6 +221,31 @@ def _shell_argv(remote: Optional[str]) -> list[str]:
     return [os.environ.get("SHELL", "/bin/sh"), "-l"]
 
 
+async def _fetch_info(
+    remote: Optional[str],
+    command: str,
+    label: str = "fetch",
+) -> Optional[SessionInfo]:
+    """Run *command* via $SHELL -l, parse the first stdout line as a SessionInfo."""
+    argv = _shell_argv(remote)
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await proc.communicate(input=(command + "\n").encode())
+    except asyncio.CancelledError:
+        proc.kill()
+        await proc.wait()
+        raise
+    if stderr.strip():
+        log.debug("%s: stderr: %s", label, stderr.decode(errors="replace").rstrip())
+    lines = stdout.decode(errors="replace").splitlines()
+    return _parse_line(lines[0], remote) if lines else None
+
+
 async def _ssh_run(remote: Optional[str], script: str, label: str = "ssh_run") -> None:
     """Run *script* on *remote* (or locally) via $SHELL -l on stdin."""
     log.debug("%s: running script:\n%s", label, script)
@@ -529,3 +554,79 @@ async def listen(
         await _ssh_run(remote, cleanup, label="listen-cleanup")
         await queue.put(None)  # unblock any pending consumer
         log.debug("listen: done")
+
+
+# ---------------------------------------------------------------------------
+# Method: poll
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def poll(
+    session: "SessionInfo | str",
+    remote: Optional[str] = None,
+    dwell: int = 10,
+    interval: int = 5,
+) -> AsyncIterator[AsyncIterator[SessionInfo]]:
+    """Monitor by polling ``tmux list-panes`` every *interval* seconds.
+
+    Unlike the hook-based methods, this works for sessions with no attached
+    client.  An event is emitted on the first poll, whenever ``session_activity``
+    changes between polls (activity detected), and every *dwell* seconds when
+    no activity is seen (silence notification).
+
+    *interval* is clamped to *dwell* so silence events are never overdue.
+    Each poll opens a short-lived SSH connection; the default interval of 5 s
+    is a reasonable balance between latency and connection overhead.
+    """
+    target, remote = _resolve_session_spec(session, remote)
+    effective_interval = min(interval, dwell)
+    log.debug("poll: target=%r remote=%r dwell=%s interval=%s",
+              target, remote, dwell, effective_interval)
+    queue: asyncio.Queue = asyncio.Queue()
+
+    t = shlex.quote(target)
+    f = shlex.quote(_FMT)
+    poll_cmd = f"tmux list-panes -t {t} -F {f}"
+
+    async def _poll_loop() -> None:
+        last_activity_at: Optional[datetime] = None
+        last_event_at: Optional[datetime] = None
+
+        while True:
+            try:
+                info = await _fetch_info(remote, poll_cmd, label="poll")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.debug("poll: fetch error: %s", exc)
+                info = None
+
+            if info is not None:
+                now = datetime.now(tz=timezone.utc)
+                first = last_event_at is None
+                activity_changed = (
+                    last_activity_at is not None
+                    and info.activity_at != last_activity_at
+                )
+                silence_due = (
+                    last_event_at is not None
+                    and (now - last_event_at).total_seconds() >= dwell
+                )
+                if first or activity_changed or silence_due:
+                    log.debug("poll: emit first=%s activity=%s silence=%s",
+                              first, activity_changed, silence_due)
+                    await queue.put(info)
+                    last_event_at = now
+                last_activity_at = info.activity_at
+
+            await asyncio.sleep(effective_interval)
+
+    poll_task = asyncio.create_task(_poll_loop())
+    try:
+        yield _queue_iter(queue)
+    finally:
+        log.debug("poll: shutting down")
+        poll_task.cancel()
+        await asyncio.gather(poll_task, return_exceptions=True)
+        await queue.put(None)
+        log.debug("poll: done")

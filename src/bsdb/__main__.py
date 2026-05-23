@@ -110,6 +110,7 @@ _MONITOR_METHODS = {
     "pipe": tmux_monitor.pipe,
     "socat": tmux_monitor.socat,
     "listen": tmux_monitor.listen,
+    "poll": tmux_monitor.poll,
 }
 
 

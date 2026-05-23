@@ -88,11 +88,12 @@ Each hook captures the current
 session state via `tmux list-panes -F ...` and delivers it through the chosen
 transport.
 
-| Function | Transport |
-|----------|-----------|
-| `pipe(session, remote, dwell)` | Named FIFO in `$XDG_RUNTIME_DIR`; `cat` streams it back over SSH stdout |
-| `socat(session, remote, dwell)` | Unix domain socket; `socat UNIX-LISTEN` streams it back over SSH stdout |
-| `listen(session, remote, dwell)` | SSH `-R` reverse port forward; asyncio TCP server receives locally |
+| Function | Transport | Works detached? |
+|----------|-----------|-----------------|
+| `pipe(session, remote, dwell)` | Named FIFO; `cat` streams it back over SSH stdout | No — tmux hook alerts require an attached client |
+| `socat(session, remote, dwell)` | Unix domain socket; `socat UNIX-LISTEN` streams it back over SSH stdout | No |
+| `listen(session, remote, dwell)` | SSH `-R` reverse port forward; asyncio TCP server receives locally | No |
+| `poll(session, remote, dwell, interval=5)` | Polls `tmux list-panes` every *interval* seconds; detects activity via `session_activity` timestamp change | **Yes** |
 
 The shared format string written by every hook is a tab-separated subset of
 `list-panes -F` fields (12 fields, same order as `list()` but without
@@ -125,7 +126,7 @@ CMD (e.g. `emacs -nw`) are not consumed by Click.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--method / -m` | `pipe` | Monitoring transport (`pipe`, `socat`, `listen`) |
+| `--method / -m` | `pipe` | Monitoring transport (`pipe`, `socat`, `listen`, `poll`) |
 | `--dwell / -d` | `10` | Silence timeout in seconds |
 
 The `monitor` command body is `asyncio.run(_run())` with a SIGINT handler that
