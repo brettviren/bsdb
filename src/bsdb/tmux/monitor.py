@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import os
 import shlex
@@ -52,6 +53,55 @@ _HOOKS = ("alert-bell", "alert-silence", "alert-activity")
 # $HOME is universally available in fish, bash, sh, and zsh; the
 # ${VAR:-default} bash/sh syntax is invalid in fish, so we avoid it here.
 _RUN_DIR = "$HOME/.cache/bsdb"
+
+
+# JSON format string used by the loop() method.  Numeric tmux fields are
+# emitted without quotes so they parse as JSON numbers; session_last_attached
+# is always quoted because it can be an empty string (never-attached session).
+_JSON_FMT = (
+    '{"session_name":"#{session_name}",'
+    '"session_id":"#{session_id}",'
+    '"window_id":"#{window_id}",'
+    '"pane_id":"#{pane_id}",'
+    '"pane_pid":#{pane_pid},'
+    '"session_created":#{session_created},'
+    '"cmd":"#{pane_current_command}",'
+    '"cwd":"#{pane_current_path}",'
+    '"session_attached":#{session_attached},'
+    '"session_activity":#{session_activity},'
+    '"session_last_attached":"#{session_last_attached}",'
+    '"session_many_attached":#{session_many_attached}}'
+)
+
+# Printed to stdout just before the remote while-loop starts so the Python
+# reader can discard login / MOTD text that precedes it.
+_LOOP_SENTINEL = "bsdb-loop-start"
+
+
+def _parse_json_obj(obj: dict, remote: Optional[str]) -> Optional[SessionInfo]:
+    """Convert a JSON dict produced by the loop() remote script to SessionInfo."""
+    try:
+        last_ts = str(obj.get("session_last_attached", "")).strip()
+        return SessionInfo(
+            session_name=obj["session_name"],
+            session_id=obj["session_id"],
+            window_id=obj["window_id"],
+            pane_id=obj["pane_id"],
+            pane_pid=int(obj["pane_pid"]),
+            remote=remote,
+            created_at=datetime.fromtimestamp(int(obj["session_created"]), tz=timezone.utc),
+            cmd=obj["cmd"],
+            cwd=str(obj.get("cwd", "")).strip() or None,
+            attached=int(obj["session_attached"]),
+            activity_at=datetime.fromtimestamp(int(obj["session_activity"]), tz=timezone.utc),
+            last_attached_at=(
+                datetime.fromtimestamp(int(last_ts), tz=timezone.utc) if last_ts else None
+            ),
+            many_attached=bool(int(obj["session_many_attached"])),
+        )
+    except (KeyError, ValueError, TypeError) as exc:
+        log.debug("loop parse_json: error (%s) for: %r", exc, obj)
+        return None
 
 
 def _parse_line(line: str, remote: Optional[str]) -> Optional[SessionInfo]:
@@ -630,3 +680,150 @@ async def poll(
         await asyncio.gather(poll_task, return_exceptions=True)
         await queue.put(None)
         log.debug("poll: done")
+
+
+# ---------------------------------------------------------------------------
+# Method: loop
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def loop(
+    session: "SessionInfo | str",
+    remote: Optional[str] = None,
+    dwell: int = 10,
+    interval: int = 5,
+) -> AsyncIterator[AsyncIterator[SessionInfo]]:
+    """Monitor via a persistent remote shell loop that polls ``tmux list-panes``.
+
+    A single SSH connection is kept open for the lifetime of the monitor.  A
+    bash while-loop on the remote calls ``tmux list-panes`` every *interval*
+    seconds and prints one newline-delimited JSON object per iteration to
+    stdout.
+
+    A sentinel line is printed before the while-loop begins so that any
+    login / MOTD text that precedes it is silently discarded.  If the tmux
+    server disappears (e.g. "no server running on …") the error is detected
+    and monitoring stops cleanly.
+
+    Unlike the hook-based methods this works for detached sessions; unlike
+    ``poll`` it avoids a fresh SSH connection on every iteration.
+    """
+    target, remote = _resolve_session_spec(session, remote)
+    log.debug("loop: target=%r remote=%r dwell=%s interval=%s",
+              target, remote, dwell, interval)
+    queue: asyncio.Queue = asyncio.Queue()
+
+    t = shlex.quote(target)
+    f = shlex.quote(_JSON_FMT)
+
+    # Build the bash script first, then base64-encode it so the outer login
+    # shell (fish, zsh, …) does not need to understand bash while-loop syntax.
+    # The outer shell only sees: printf '…' | base64 -d | bash
+    inner = "\n".join([
+        f"printf '%s\\n' {shlex.quote(_LOOP_SENTINEL)}",
+        "while true; do",
+        f"    tmux list-panes -t {t} -F {f} 2>&1 | head -1",
+        f"    sleep {interval}",
+        "done",
+    ])
+    b64 = base64.b64encode(inner.encode()).decode()
+    loop_script = f"printf '%s' {shlex.quote(b64)} | base64 -d | bash"
+    log.debug("loop: inner bash script:\n%s", inner)
+
+    argv = _shell_argv(remote)
+    log.debug("loop: launching stream process: %s", argv)
+    stream_proc = await asyncio.create_subprocess_exec(
+        *argv,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    log.debug("loop: stream process pid=%s", stream_proc.pid)
+    stream_proc.stdin.write((loop_script + "\n").encode())
+    await stream_proc.stdin.drain()
+    stream_proc.stdin.close()
+
+    async def _loop_drain() -> None:
+        log.debug("loop: drain task started")
+
+        # Discard all output until (and including) the sentinel line so that
+        # login banners, MOTD messages, etc. do not reach the JSON parser.
+        while True:
+            try:
+                raw = await stream_proc.stdout.readline()
+            except asyncio.CancelledError:
+                log.debug("loop: drain task cancelled before sentinel")
+                await queue.put(None)
+                return
+            except Exception as exc:
+                log.debug("loop: read error before sentinel: %s", exc)
+                await queue.put(None)
+                return
+            if not raw:
+                log.debug("loop: EOF before sentinel")
+                await queue.put(None)
+                return
+            line = raw.decode(errors="replace").rstrip("\n")
+            log.debug("loop: pre-sentinel: %r", line)
+            if line == _LOOP_SENTINEL:
+                log.debug("loop: sentinel found, entering JSON phase")
+                break
+
+        # Parse JSON lines produced by the remote while-loop.
+        while True:
+            try:
+                raw = await stream_proc.stdout.readline()
+            except asyncio.CancelledError:
+                log.debug("loop: drain task cancelled")
+                break
+            except Exception as exc:
+                log.debug("loop: read error: %s", exc)
+                break
+            if not raw:
+                log.debug("loop: EOF")
+                break
+            line = raw.decode(errors="replace").rstrip("\n")
+            if not line:
+                continue
+            log.debug("loop: raw line: %r", line)
+
+            # tmux server gone (e.g. "no server running on /tmp/tmux-1000/default")
+            if "no server running on" in line:
+                log.info("loop: tmux server gone: %s", line)
+                break
+
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                log.info("loop: unexpected output (stopping): %r", line[:120])
+                break
+
+            info = _parse_json_obj(obj, remote)
+            if info is not None:
+                await queue.put(info)
+
+        await queue.put(None)
+        log.debug("loop: drain task done")
+
+    drain_task = asyncio.create_task(_loop_drain())
+    stderr_task = asyncio.create_task(_log_stream(stream_proc.stderr, "loop stderr"))
+
+    try:
+        yield _queue_iter(queue)
+    finally:
+        log.debug("loop: shutting down")
+        drain_task.cancel()
+        stderr_task.cancel()
+        stream_proc.terminate()
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(stream_proc.wait(), drain_task, stderr_task,
+                               return_exceptions=True),
+                timeout=2.0,
+            )
+        except asyncio.TimeoutError:
+            log.debug("loop: SIGTERM timed out — sending SIGKILL")
+            stream_proc.kill()
+            await asyncio.gather(stream_proc.wait(), drain_task, stderr_task,
+                                 return_exceptions=True)
+        log.debug("loop: done")

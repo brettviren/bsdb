@@ -111,6 +111,7 @@ _MONITOR_METHODS = {
     "socat": tmux_monitor.socat,
     "listen": tmux_monitor.listen,
     "poll": tmux_monitor.poll,
+    "loop": tmux_monitor.loop,
 }
 
 
@@ -170,7 +171,8 @@ def monitor_cmd(target, remote, method, dwell):
                 log.debug("monitor: consume loop ended")
 
             consume_task = asyncio.create_task(_consume())
-            log.debug("monitor: waiting for SIGINT")
+            consume_task.add_done_callback(lambda _: stop.set())
+            log.debug("monitor: waiting for SIGINT or stream end")
             await stop.wait()
             log.debug("monitor: cancelling consume task")
             consume_task.cancel()
