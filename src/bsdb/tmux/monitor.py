@@ -104,6 +104,7 @@ def _parse_json_obj(obj: dict, remote: Optional[str]) -> Optional[SessionInfo]:
                 datetime.fromtimestamp(int(last_ts), tz=timezone.utc) if last_ts else None
             ),
             many_attached=bool(int(obj["session_many_attached"])),
+            message=str(obj["message"]).strip() or None if "message" in obj else None,
         )
     except (KeyError, ValueError, TypeError) as exc:
         log.debug("loop parse_json: error (%s) for: %r", exc, obj)
@@ -766,10 +767,19 @@ async def loop(
     inner = "\n".join([
         f"printf '%s\\n' {shlex.quote(_LOOP_SENTINEL)}",
         "while true; do",
+        f"    _ID=$(tmux lsp -t {t} -F '#{{=-1:session_id}}-#{{=-1:window_id}}' 2>/dev/null | head -1)",
+        "    _STATUS=$XDG_RUNTIME_DIR/bsdb/status-$_ID.json",
+        '    if [ -f "$_STATUS" ]; then',
+        "        _INGEST=$XDG_RUNTIME_DIR/bsdb/ingest-$_ID.json",
+        '        mv "$_STATUS" "$_INGEST"',
+        '        cat "$_INGEST"',
+        '        rm -f "$_INGEST"',
+        "    else",
         # list-windows gives one line per window; pane-level format variables
         # (pane_id, pane_pid, pane_current_command, pane_current_path) resolve
         # to the active pane of each window, so all windows are always reported.
-        f"    tmux list-windows -t {t} -F {f} 2>&1",
+        f"        tmux list-windows -t {t} -F {f} 2>&1",
+        "    fi",
         f"    sleep {interval}",
         "done",
     ])

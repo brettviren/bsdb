@@ -31,6 +31,7 @@ class SessionInfo:
     activity_at: datetime  # time of last pane activity (UTC)
     last_attached_at: Optional[datetime]  # time a client last attached (UTC); None if never attached
     many_attached: bool    # True when more than one client is attached
+    message: Optional[str] = None  # arbitrary text injected via inject-status.sh; None if absent
 
 
 def _resolve_remote(remote: Optional[str]) -> Optional[str]:

@@ -13,9 +13,9 @@ from typing import Optional
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import ScrollableContainer, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Header, Input, Label
+from textual.widgets import DataTable, Footer, Header, Input, Label, Static
 
 from bsdb.tmux import SessionInfo
 from bsdb.tmux import connection as tmux_connection
@@ -24,6 +24,11 @@ from bsdb.tmux import list as tmux_list
 import bsdb.tmux.monitor as monitor
 
 log = logging.getLogger(__name__)
+
+# Sum of the fixed column widths (bullet + remote + window + cmd + status).
+# Used to compute how many characters the Message column can fill.
+_FIXED_COL_TOTAL = 1 + 20 + 22 + 14 + 24  # = 81
+_MSG_COL_MIN = 10
 
 # terminal emulators tried in order when not inside tmux; each entry is
 # (binary, extra_args_before_cmd).
@@ -103,6 +108,68 @@ def _spawn_terminal(cmd: list[str]) -> None:
             subprocess.Popen([binary] + prefix + cmd)
             return
     log.warning("no terminal emulator found; set $TERMINAL")
+
+
+def _msg_first_line(message: Optional[str], max_chars: int = _FIXED_COL_TOTAL) -> str:
+    """First line of *message* truncated to *max_chars* characters with '…' if cut."""
+    if not message:
+        return ""
+    line = message.splitlines()[0]
+    if len(line) <= max_chars:
+        return line
+    return line[: max_chars - 1] + "…"
+
+
+# ---------------------------------------------------------------------------
+# message viewer modal
+# ---------------------------------------------------------------------------
+
+class _MessageScreen(ModalScreen):
+    """Full-message viewer for the selected session row."""
+
+    BINDINGS = [
+        Binding("q", "close", "Close"),
+        Binding("escape", "close", "Close"),
+    ]
+
+    DEFAULT_CSS = """
+    _MessageScreen {
+        align: center middle;
+    }
+    _MessageScreen > Vertical {
+        width: 80%;
+        height: 70%;
+        max-width: 100;
+        background: $surface;
+        border: round $accent;
+        padding: 1 2;
+    }
+    _MessageScreen Label.title {
+        text-style: bold;
+        margin-bottom: 1;
+    }
+    _MessageScreen ScrollableContainer {
+        height: 1fr;
+        border: solid $panel;
+        padding: 0 1;
+    }
+    """
+
+    def __init__(self, info: SessionInfo) -> None:
+        super().__init__()
+        self._info = info
+
+    def compose(self) -> ComposeResult:
+        label = f"{self._info.session_name}:{self._info.window_id}"
+        if self._info.remote:
+            label = f"{self._info.remote}  {label}"
+        with Vertical():
+            yield Label(label, classes="title")
+            with ScrollableContainer():
+                yield Static(Text(self._info.message or ""))
+
+    def action_close(self) -> None:
+        self.dismiss()
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +284,7 @@ class BsdbApp(App):
         Binding("n", "new_session", "New"),
         Binding("v", "visit", "Visit"),
         Binding("t", "terminal", "Terminal"),
+        Binding("m", "message", "Message"),
         Binding("r", "refresh", "Refresh"),
         Binding("q", "quit", "Quit"),
         Binding("j", "nav_down", "Down", show=False),
@@ -246,6 +314,9 @@ class BsdbApp(App):
         self._group_rows: dict[str, set[str]] = {}
         # remotes used for discovery (no session filter); refreshed on 'r'
         self._discovery_remotes: list[Optional[str]] = []
+        # ColumnKey for the Message column (set in compose); current display width
+        self._msg_col_key = None
+        self._msg_col_width: int = _MSG_COL_MIN
 
     # ── layout ────────────────────────────────────────────────────────────
 
@@ -257,10 +328,12 @@ class BsdbApp(App):
         t.add_column("Window", width=22, key="window")
         t.add_column("Command", width=14, key="cmd")
         t.add_column("Idle / Status", width=24, key="status")
+        self._msg_col_key = t.add_column("Message", width=28, key="message")
         yield t
         yield Footer()
 
     def on_mount(self) -> None:
+        self._set_msg_col_width(self.size.width)
         targets = self._init_targets or [""]
         for arg in targets:
             remote, session = _parse_target(arg)
@@ -273,6 +346,9 @@ class BsdbApp(App):
                 self.run_worker(self._discover(remote), exclusive=False)
         # refresh status-light colours between monitor events
         self.set_interval(10, self._tick_status)
+
+    def on_resize(self, event) -> None:
+        self._set_msg_col_width(event.size.width)
 
     # ── discovery ─────────────────────────────────────────────────────────
 
@@ -369,12 +445,14 @@ class BsdbApp(App):
             self._group_rows.setdefault(group_key, set()).add(wkey)
         bullet, status = _make_status(info)
         window_label = f"{info.session_name}:{info.window_id}"
+        msg_preview = _msg_first_line(info.message, self._msg_col_width)
         table = self.query_one("#sessions", DataTable)
         if wkey in self._table_rows:
             table.update_cell(wkey, "bullet", bullet, update_width=False)
             table.update_cell(wkey, "window", window_label, update_width=False)
             table.update_cell(wkey, "cmd", info.cmd, update_width=False)
             table.update_cell(wkey, "status", status, update_width=False)
+            table.update_cell(wkey, "message", msg_preview, update_width=False)
         else:
             self._table_rows.add(wkey)
             table.add_row(
@@ -383,6 +461,7 @@ class BsdbApp(App):
                 window_label,
                 info.cmd,
                 status,
+                msg_preview,
                 key=wkey,
             )
 
@@ -398,6 +477,25 @@ class BsdbApp(App):
                 self.query_one("#sessions", DataTable).remove_row(wk)
             except Exception:
                 pass
+
+    def _set_msg_col_width(self, terminal_width: int) -> None:
+        """Resize the Message column to fill available terminal space."""
+        # Subtract 1 extra char so the vertical scrollbar never clips the column.
+        new_width = max(_MSG_COL_MIN, terminal_width - _FIXED_COL_TOTAL - 1)
+        if new_width == self._msg_col_width:
+            return
+        self._msg_col_width = new_width
+        table = self.query_one("#sessions", DataTable)
+        if self._msg_col_key is not None:
+            table.columns[self._msg_col_key].width = new_width
+        for wkey, info in list(self._infos.items()):
+            if wkey in self._table_rows:
+                table.update_cell(
+                    wkey, "message",
+                    _msg_first_line(info.message, new_width),
+                    update_width=False,
+                )
+        table.refresh(layout=True)
 
     def _tick_status(self) -> None:
         """Refresh status cells so idle times stay current between loop events."""
@@ -472,6 +570,16 @@ class BsdbApp(App):
             return
         self._ensure_watching(info)
         self.notify(f"Launched {info.session_name} on {info.remote or 'local'}")
+
+    def action_message(self) -> None:
+        info = self._cursor_info()
+        if info is None:
+            self.notify("No session selected", severity="warning")
+            return
+        if not info.message:
+            self.notify("No message for this session", severity="information")
+            return
+        self.push_screen(_MessageScreen(info))
 
     def action_visit(self) -> None:
         info = self._cursor_info()
