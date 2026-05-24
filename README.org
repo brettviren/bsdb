@@ -1,17 +1,14 @@
 #+title: bsdb - borescope dashboard
 
-bsdb provides ways to launch, monitor and reenter tasks running in local or remote terminal sessions.
+bsdb provides ways to launch, monitor and reenter tasks running in local or remote tmux sessions using ssh.
 
-bsdb is experimental and not yet well formed.  Some of what is below is implemented and some is still notional.
 
-The core ingredients as these independent Python modules:
+[[./main.svg]]
 
-- =bsdb.tmux= functions for ssh+tmux operations (launch, attach, list, ...).
-- =bsdb.state= sqlite-backed CRUD functions targeting state of ssh+tmux.
+It currently provides some different user interfaces.
 
-And layers on top of the core:
-
-- =bsdb.manager= mid-level functions and classes to track and expose state of tmux operations and sessions.
-
-More to come...
+- [X] CLI via click
+- [X] TUI via textual
+- [ ] GUI 
+- [ ] WUI
 
