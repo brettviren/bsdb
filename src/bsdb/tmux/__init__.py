@@ -92,6 +92,8 @@ def _run(args: list[str], remote: Optional[str] = None) -> subprocess.CompletedP
 def connection(
     session: "SessionInfo | str",
     remote: Optional[str] = None,
+    *,
+    window: Optional[str] = None,
 ) -> list[str]:
     """Return the command list needed to attach to an existing tmux session.
 
@@ -104,12 +106,18 @@ def connection(
                  session name, or a ``"host:name"`` string as printed by
                  :func:`launch`.
         remote:  SSH target; ``None`` = local.
+        window:  tmux window ID (e.g. ``"@1"``) or index to select on attach.
+                 When given, the target becomes ``SESSION:WINDOW`` so tmux
+                 switches directly to that window instead of using the last
+                 active one.
 
     Returns:
         ``["tmux", "attach-session", "-t", target]`` for local sessions, or
         ``["ssh", "-t", remote, "$SHELL -l -c <cmd>"]`` for remote ones.
     """
     target, remote = _resolve_session_spec(session, remote)
+    if window:
+        target = f"{target}:{window}"
     args = ["tmux", "attach-session", "-t", target]
     if remote:
         # ssh -t allocates a PTY so the tmux client can drive the terminal.

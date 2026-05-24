@@ -183,6 +183,38 @@ def monitor_cmd(target, remote, method, dwell):
     asyncio.run(_run())
 
 
+@cli.command("tui")
+@click.argument("targets", nargs=-1, metavar="[TARGET...]")
+@click.option(
+    "-d", "--dwell",
+    type=int, default=30, show_default=True,
+    help="Silence timeout in seconds passed to the monitor.",
+)
+@click.option(
+    "-i", "--interval",
+    type=int, default=5, show_default=True,
+    help="Poll interval in seconds for the loop monitor.",
+)
+def tui_cmd(targets, dwell, interval):
+    """Interactive TUI for monitoring tmux sessions.
+
+    Each TARGET is an SSH connection string: user@host for full discovery,
+    or user@host:session-name to track one specific session.  When no
+    TARGET is given, local sessions are discovered automatically.
+
+    Key bindings inside the TUI:
+
+    \b
+      a  add a remote (prompts for user@host or user@host:session)
+      v  visit (attach in current terminal)
+      t  terminal (open a new terminal/tmux-window with the attachment)
+      r  refresh discovery for all hosts
+      q  quit
+    """
+    from bsdb.tui import BsdbApp
+    BsdbApp(targets=list(targets), dwell=dwell, interval=interval).run()
+
+
 def main():
     cli()
 

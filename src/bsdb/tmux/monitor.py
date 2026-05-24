@@ -69,6 +69,7 @@ _JSON_FMT = (
     '"cwd":"#{pane_current_path}",'
     '"session_attached":#{session_attached},'
     '"session_activity":#{session_activity},'
+    '"window_activity":#{window_activity},'
     '"session_last_attached":"#{session_last_attached}",'
     '"session_many_attached":#{session_many_attached}}'
 )
@@ -93,7 +94,12 @@ def _parse_json_obj(obj: dict, remote: Optional[str]) -> Optional[SessionInfo]:
             cmd=obj["cmd"],
             cwd=str(obj.get("cwd", "")).strip() or None,
             attached=int(obj["session_attached"]),
-            activity_at=datetime.fromtimestamp(int(obj["session_activity"]), tz=timezone.utc),
+            activity_at=datetime.fromtimestamp(
+                # window_activity tracks actual pane writes; session_activity
+                # only reflects attachment events in some tmux builds.
+                int(obj["window_activity"]) or int(obj["session_activity"]),
+                tz=timezone.utc,
+            ),
             last_attached_at=(
                 datetime.fromtimestamp(int(last_ts), tz=timezone.utc) if last_ts else None
             ),
@@ -315,6 +321,7 @@ async def _ssh_run(remote: Optional[str], script: str, label: str = "ssh_run") -
     stdout_task.cancel()
     stderr_task.cancel()
     await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+    proc._transport.close()
     log.debug("%s: exit code %s", label, proc.returncode)
 
 
@@ -383,7 +390,18 @@ async def pipe(
         drain_task.cancel()
         stderr_task.cancel()
         stream_proc.terminate()
-        await asyncio.gather(stream_proc.wait(), drain_task, stderr_task, return_exceptions=True)
+        try:
+            await asyncio.gather(stream_proc.wait(), drain_task, stderr_task,
+                                 return_exceptions=True)
+        except asyncio.CancelledError:
+            stream_proc.kill()
+            try:
+                await asyncio.gather(stream_proc.wait(), drain_task,
+                                     stderr_task, return_exceptions=True)
+            except asyncio.CancelledError:
+                pass
+        finally:
+            stream_proc._transport.close()
         cleanup = "\n".join([
             _remove_hooks_cmd(target),
             f"rm -f {fifo_expr} {hook_expr}",
@@ -456,7 +474,18 @@ async def socat(
         drain_task.cancel()
         stderr_task.cancel()
         stream_proc.terminate()
-        await asyncio.gather(stream_proc.wait(), drain_task, stderr_task, return_exceptions=True)
+        try:
+            await asyncio.gather(stream_proc.wait(), drain_task, stderr_task,
+                                 return_exceptions=True)
+        except asyncio.CancelledError:
+            stream_proc.kill()
+            try:
+                await asyncio.gather(stream_proc.wait(), drain_task,
+                                     stderr_task, return_exceptions=True)
+            except asyncio.CancelledError:
+                pass
+        finally:
+            stream_proc._transport.close()
         cleanup = "\n".join([
             _remove_hooks_cmd(target),
             f"rm -f {sock_expr} {hook_expr}",
@@ -589,14 +618,29 @@ async def listen(
         _stopping.set()
         watch_task.cancel()
         server.close()
-        await server.wait_closed()
+        try:
+            await server.wait_closed()
+        except asyncio.CancelledError:
+            pass
         stdout_task.cancel()
         stderr_task.cancel()
         ssh_proc.terminate()
-        await asyncio.gather(
-            ssh_proc.wait(), watch_task, stdout_task, stderr_task,
-            return_exceptions=True,
-        )
+        try:
+            await asyncio.gather(
+                ssh_proc.wait(), watch_task, stdout_task, stderr_task,
+                return_exceptions=True,
+            )
+        except asyncio.CancelledError:
+            ssh_proc.kill()
+            try:
+                await asyncio.gather(
+                    ssh_proc.wait(), watch_task, stdout_task, stderr_task,
+                    return_exceptions=True,
+                )
+            except asyncio.CancelledError:
+                pass
+        finally:
+            ssh_proc._transport.close()
         cleanup = "\n".join([
             _remove_hooks_cmd(target),
             f"rm -f {hook_expr}",
@@ -722,7 +766,10 @@ async def loop(
     inner = "\n".join([
         f"printf '%s\\n' {shlex.quote(_LOOP_SENTINEL)}",
         "while true; do",
-        f"    tmux list-panes -t {t} -F {f} 2>&1 | head -1",
+        # list-windows gives one line per window; pane-level format variables
+        # (pane_id, pane_pid, pane_current_command, pane_current_path) resolve
+        # to the active pane of each window, so all windows are always reported.
+        f"    tmux list-windows -t {t} -F {f} 2>&1",
         f"    sleep {interval}",
         "done",
     ])
@@ -816,14 +863,25 @@ async def loop(
         stderr_task.cancel()
         stream_proc.terminate()
         try:
-            await asyncio.wait_for(
-                asyncio.gather(stream_proc.wait(), drain_task, stderr_task,
-                               return_exceptions=True),
-                timeout=2.0,
-            )
-        except asyncio.TimeoutError:
-            log.debug("loop: SIGTERM timed out — sending SIGKILL")
-            stream_proc.kill()
-            await asyncio.gather(stream_proc.wait(), drain_task, stderr_task,
-                                 return_exceptions=True)
+            # CancelledError is caught alongside TimeoutError: the outer task
+            # may still carry a pending cancellation (e.g. from asyncio.run()'s
+            # _cancel_all_tasks) that interrupts wait_for even after uncancel().
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(stream_proc.wait(), drain_task, stderr_task,
+                                   return_exceptions=True),
+                    timeout=2.0,
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                log.debug("loop: wait interrupted — sending SIGKILL")
+                stream_proc.kill()
+                try:
+                    await asyncio.gather(stream_proc.wait(), drain_task,
+                                         stderr_task, return_exceptions=True)
+                except asyncio.CancelledError:
+                    pass
+        finally:
+            # Always close the transport so BaseSubprocessTransport.__del__
+            # sees _closed=True and does not try to use the event loop.
+            stream_proc._transport.close()
         log.debug("loop: done")
